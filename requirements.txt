@@ -11,3 +11,4 @@ openpyxl
 python-docx
 reportlab
 pymupdf
+Pillow
