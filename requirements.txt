@@ -10,5 +10,5 @@ pdfplumber
 openpyxl
 python-docx
 reportlab
-pymupdf
+pymupdf>=1.24.0
 Pillow
