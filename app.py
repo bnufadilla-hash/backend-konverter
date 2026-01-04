@@ -2,7 +2,7 @@ import os
 import cv2
 import numpy as np
 import ezdxf
-from flask import Flask, request, send_file, jsonify
+from flask import Flask, request, send_file, jsonify, after_this_request
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from werkzeug.exceptions import RequestEntityTooLarge
@@ -19,16 +19,29 @@ from reportlab.lib import colors
 import fitz
 from PIL import Image
 import zipfile
+import logging
+import sys
+
+# Configure logging
+logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+# Explicitly allow all origins and headers for debugging
+CORS(app, resources={r"/*": {"origins": "*", "allow_headers": "*", "methods": "*"}})
 
 # Set Max Content Length to 50MB
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
 
 @app.errorhandler(RequestEntityTooLarge)
 def handle_file_too_large(e):
+    logger.error(f"File too large error: {e}")
     return jsonify({'error': 'File terlalu besar. Maksimum ukuran file adalah 50MB.'}), 413
+
+@app.errorhandler(500)
+def handle_internal_error(e):
+    logger.error(f"Internal Server Error: {e}")
+    return jsonify({'error': 'Terjadi kesalahan internal pada server. Cek log server.'}), 500
 
 def image_to_dxf(image_path, output_path):
     # Read image with alpha channel support (IMREAD_UNCHANGED)
@@ -165,19 +178,15 @@ def merge_pdfs(paths, output_path):
     merger.close()
 
 def compress_pdf(input_path, output_path):
-    # Aggressive compression to target ~50% size reduction
-    # 1. Downsample images > 1024px
-    # 2. Convert images to JPEG with quality 60
-    # 3. Clean and deflate PDF structure
-    
+    logger.info(f"Starting compression for {input_path}")
     try:
         doc = fitz.open(input_path)
         
         # Subset fonts
         try:
             doc.subset_fonts()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Font subsetting failed: {e}")
 
         processed_xrefs = set()
         
@@ -191,50 +200,40 @@ def compress_pdf(input_path, output_path):
                 try:
                     pix = fitz.Pixmap(doc, xref)
                     
-                    # Check if image is large enough to benefit from downscaling
                     if pix.width > 1024 or pix.height > 1024:
-                        # Convert to RGB if not already (e.g. CMYK)
                         if pix.n >= 4:
                             pix = fitz.Pixmap(fitz.csRGB, pix)
                         
-                        # Scale down
-                        # We want to reduce size significantly. 
-                        # Let's target a max dimension of 1024.
                         scale = 1024 / max(pix.width, pix.height)
-                        if scale < 0.9: # Only if reduction is > 10%
+                        if scale < 0.9: 
                             new_w = int(pix.width * scale)
                             new_h = int(pix.height * scale)
                             pix = fitz.Pixmap(pix, new_w, new_h)
                     
-                    # Recompress as JPEG with lower quality (default often 75-95, we go 60 for "half size")
-                    # Only if it wasn't already a highly compressed small image?
-                    # Actually, recompressing everything to JPEG q=60 is the surest way to drop size.
-                    
-                    # Check if it's already a small image or mask? Skip masks.
                     if pix.n < 3 and pix.alpha == 0: 
-                        # Grayscale or mono without alpha
                         pass
                     
                     new_data = pix.tobytes("jpeg", jpg_quality=60)
                     doc.update_image(xref, data=new_data)
                     
-                    pix = None # free memory
+                    pix = None 
                 except Exception as e:
-                    print(f"Image compression skipped for xref {xref}: {e}")
+                    logger.warning(f"Image compression skipped for xref {xref}: {e}")
                     pass
 
         doc.save(output_path, garbage=4, deflate=True, clean=True)
         doc.close()
+        logger.info(f"Compression successful: {output_path}")
         
     except Exception as e:
-        # Fallback to simple compression if advanced fails
-        print(f"Advanced compression failed: {e}, falling back to simple save.")
+        logger.error(f"Advanced compression failed: {e}")
         try:
             doc = fitz.open(input_path)
             doc.save(output_path, garbage=4, deflate=True)
             doc.close()
-        except:
-            raise e
+        except Exception as fallback_error:
+            logger.error(f"Fallback compression failed: {fallback_error}")
+            raise fallback_error
 
 def pdf_to_image(pdf_path, image_path):
     doc = fitz.open(pdf_path)
@@ -288,6 +287,7 @@ def convert():
             )
             
         except Exception as e:
+            logger.error(f"Convert error: {e}")
             return jsonify({'error': str(e)}), 500
             
         finally:
@@ -296,8 +296,6 @@ def convert():
                 os.unlink(input_path)
             if temp_img_path and os.path.exists(temp_img_path):
                 os.unlink(temp_img_path)
-            # output_path is kept open by send_file? 
-            # In production, use background cleanup or streaming. 
             pass
 
 @app.route('/pdf/merge', methods=['POST'])
@@ -312,13 +310,11 @@ def pdf_merge_route():
         for f in files:
             ext = os.path.splitext(f.filename.lower())[1]
             
-            # Save original upload
             with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as t:
                 f.save(t.name)
                 current_path = t.name
                 tmp_paths.append(current_path)
             
-            # Convert if needed
             if ext in ['.jpg', '.jpeg', '.png']:
                 with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as pdf_out:
                     image_to_pdf(current_path, pdf_out.name)
@@ -330,7 +326,6 @@ def pdf_merge_route():
             elif ext == '.pdf':
                 converted_tmp_paths.append(current_path)
             else:
-                # Skip or error? For now, skip unsupported
                 pass
 
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as out:
@@ -338,13 +333,12 @@ def pdf_merge_route():
             return send_file(out.name, as_attachment=True, download_name='merged.pdf', mimetype='application/pdf')
             
     except Exception as e:
+        logger.error(f"Merge error: {e}")
         return jsonify({'error': str(e)}), 500
     finally:
-        # Cleanup original uploads
         for p in tmp_paths:
             if os.path.exists(p):
                 os.unlink(p)
-        # Cleanup converted pdfs that are not in tmp_paths (images/docx converted)
         for p in converted_tmp_paths:
             if p not in tmp_paths and os.path.exists(p):
                 os.unlink(p)
@@ -359,7 +353,7 @@ def pdf_convert_route():
         return jsonify({'error': 'Missing target'}), 400
     ext = os.path.splitext(f.filename.lower())[1]
     
-    input_path = None # Initialize variables for cleanup
+    input_path = None 
     
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as src:
@@ -390,6 +384,7 @@ def pdf_convert_route():
             return jsonify({'error': 'Unsupported conversion'}), 400
             
     except Exception as e:
+        logger.error(f"Convert doc error: {e}")
         return jsonify({'error': str(e)}), 500
     finally:
         if input_path and os.path.exists(input_path):
@@ -400,14 +395,14 @@ def pdf_convert_route():
 
 @app.route('/pdf/compress', methods=['POST'])
 def pdf_compress_route():
-    # Try getting 'files' list first (for multiple files)
-    files = request.files.getlist('files')
+    logger.info("Received compress request")
     
-    # If empty, try 'file' (fallback for single file upload from some clients)
+    files = request.files.getlist('files')
     if not files:
         files = request.files.getlist('file')
     
     if not files:
+        logger.error("No files found in request")
         return jsonify({'error': 'No file uploaded'}), 400
         
     tmp_paths = []
@@ -415,15 +410,15 @@ def pdf_compress_route():
     
     try:
         for f in files:
-            # Check filename exists
             if not f.filename:
                 continue
                 
-            # Use original filename extension
             ext = os.path.splitext(f.filename)[1].lower()
             if ext != '.pdf':
-                continue # Skip non-pdfs
+                continue 
                 
+            logger.info(f"Processing file: {f.filename}")
+            
             with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as src:
                 f.save(src.name)
                 tmp_paths.append(src.name)
@@ -433,13 +428,28 @@ def pdf_compress_route():
             compressed_paths.append((out_path, f.filename))
 
         if not compressed_paths:
+             logger.error("No valid PDF files processed")
              return jsonify({'error': 'No valid PDF files processed. Please upload PDF files.'}), 400
 
+        # Schedule cleanup after request
+        @after_this_request
+        def cleanup(response):
+            for p in tmp_paths:
+                if os.path.exists(p):
+                    try:
+                        os.unlink(p)
+                    except Exception as e:
+                        logger.warning(f"Failed to delete temp input {p}: {e}")
+            # Note: We can't delete output files yet if we are streaming them.
+            # In a real production app, use a periodic cleaner or a temp dir that auto-cleans.
+            # For now, we rely on OS temp cleaning or manual restart.
+            return response
+
         if len(compressed_paths) == 1:
-            # Single file return
+            logger.info("Returning single compressed file")
             return send_file(compressed_paths[0][0], as_attachment=True, download_name='compressed.pdf', mimetype='application/pdf')
         else:
-            # Multiple files -> ZIP
+            logger.info("Returning zip of compressed files")
             with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as zip_out:
                 with zipfile.ZipFile(zip_out.name, 'w') as zf:
                     for path, original_name in compressed_paths:
@@ -447,24 +457,8 @@ def pdf_compress_route():
                 return send_file(zip_out.name, as_attachment=True, download_name='compressed_files.zip', mimetype='application/zip')
 
     except Exception as e:
-        # Log error for debugging (in production logging would be better)
-        print(f"Compression error: {str(e)}")
+        logger.error(f"Compression route error: {e}")
         return jsonify({'error': f"Compression failed: {str(e)}"}), 500
-    finally:
-        # Cleanup temporary input files
-        for p in tmp_paths:
-            if os.path.exists(p):
-                try:
-                    os.unlink(p)
-                except:
-                    pass
-        # Cleanup temporary output files (only if they are not being streamed)
-        # Note: send_file keeps the file handle open, so we rely on OS or specific Flask configs for cleanup usually.
-        # However, for temp files created with delete=False, we should clean them up.
-        # But cleaning up immediately after return send_file might fail if file is still in use.
-        # A common strategy is to use after_request or a background task, but simple tempfile is hard to clean perfectly in basic Flask.
-        # For this snippet, we leave the output files. In a production app, use a proper temp directory lifecycle.
-        pass
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
