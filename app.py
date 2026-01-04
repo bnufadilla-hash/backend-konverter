@@ -16,6 +16,8 @@ from reportlab.pdfgen import canvas
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle
 from reportlab.lib import colors
 import fitz
+from PIL import Image
+import zipfile
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
@@ -114,6 +116,12 @@ def xlsx_to_pdf(xlsx_path, output_path):
             elements.append(tbl)
     doc.build(elements)
 
+def image_to_pdf(image_path, output_path):
+    image = Image.open(image_path)
+    if image.mode != 'RGB':
+        image = image.convert('RGB')
+    image.save(output_path, "PDF", resolution=100.0)
+
 def merge_pdfs(paths, output_path):
     merger = PdfMerger()
     for p in paths:
@@ -125,6 +133,12 @@ def compress_pdf(input_path, output_path):
     doc = fitz.open(input_path)
     doc.save(output_path, garbage=4, deflate=True)
     doc.close()
+
+def pdf_to_image(pdf_path, image_path):
+    doc = fitz.open(pdf_path)
+    page = doc[0] # Take first page
+    pix = page.get_pixmap()
+    pix.save(image_path)
 
 @app.route('/')
 def index():
@@ -140,16 +154,28 @@ def convert():
         return jsonify({'error': 'No selected file'}), 400
         
     if file:
+        input_path = None
+        temp_img_path = None
+        output_path = None
         try:
-            # Create temporary files for processing
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp_img:
-                file.save(tmp_img.name)
-                input_path = tmp_img.name
-                
+            ext = os.path.splitext(file.filename.lower())[1]
+            
+            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+                file.save(tmp.name)
+                input_path = tmp.name
+
+            temp_img_path = input_path + '.png'
+            if ext == '.pdf':
+                # Convert PDF to Image first
+                pdf_to_image(input_path, temp_img_path)
+                processing_path = temp_img_path
+            else:
+                processing_path = input_path
+
             output_path = input_path + '.dxf'
             
             # Process image to DXF
-            image_to_dxf(input_path, output_path)
+            image_to_dxf(processing_path, output_path)
             
             # Send file back
             return send_file(
@@ -164,14 +190,12 @@ def convert():
             
         finally:
             # Cleanup temp files
-            if 'input_path' in locals() and os.path.exists(input_path):
+            if input_path and os.path.exists(input_path):
                 os.unlink(input_path)
-            # We don't delete output_path immediately if we stream it? 
-            # send_file usually keeps file open. 
-            # For simplicity in this script, we might leave a temp file or use a cleanup approach.
-            # But Flask's send_file doesn't auto-delete.
-            # For a production app, consider using a background task or byte stream.
-            # Here we will just let OS temp cleanup handle it eventually or leave it for now.
+            if temp_img_path and os.path.exists(temp_img_path):
+                os.unlink(temp_img_path)
+            # output_path is kept open by send_file? 
+            # In production, use background cleanup or streaming. 
             pass
 
 @app.route('/pdf/merge', methods=['POST'])
@@ -180,19 +204,47 @@ def pdf_merge_route():
     if not files:
         return jsonify({'error': 'No files'}), 400
     tmp_paths = []
+    converted_tmp_paths = []
+    
     try:
         for f in files:
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as t:
+            ext = os.path.splitext(f.filename.lower())[1]
+            
+            # Save original upload
+            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as t:
                 f.save(t.name)
-                tmp_paths.append(t.name)
+                current_path = t.name
+                tmp_paths.append(current_path)
+            
+            # Convert if needed
+            if ext in ['.jpg', '.jpeg', '.png']:
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as pdf_out:
+                    image_to_pdf(current_path, pdf_out.name)
+                    converted_tmp_paths.append(pdf_out.name)
+            elif ext == '.docx':
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as pdf_out:
+                    docx_to_pdf(current_path, pdf_out.name)
+                    converted_tmp_paths.append(pdf_out.name)
+            elif ext == '.pdf':
+                converted_tmp_paths.append(current_path)
+            else:
+                # Skip or error? For now, skip unsupported
+                pass
+
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as out:
-            merge_pdfs(tmp_paths, out.name)
+            merge_pdfs(converted_tmp_paths, out.name)
             return send_file(out.name, as_attachment=True, download_name='merged.pdf', mimetype='application/pdf')
+            
     except Exception as e:
         return jsonify({'error': str(e)}), 500
     finally:
+        # Cleanup original uploads
         for p in tmp_paths:
             if os.path.exists(p):
+                os.unlink(p)
+        # Cleanup converted pdfs that are not in tmp_paths (images/docx converted)
+        for p in converted_tmp_paths:
+            if p not in tmp_paths and os.path.exists(p):
                 os.unlink(p)
 
 @app.route('/pdf/convert', methods=['POST'])
@@ -233,21 +285,48 @@ def pdf_convert_route():
 
 @app.route('/pdf/compress', methods=['POST'])
 def pdf_compress_route():
-    if 'file' not in request.files:
+    # Handle multiple files or single file
+    files = request.files.getlist('file') # Try 'file' list
+    if not files:
+         # Try 'files' if frontend sends that
+        files = request.files.getlist('files')
+    
+    if not files:
         return jsonify({'error': 'No file'}), 400
-    f = request.files['file']
+        
+    tmp_paths = []
+    compressed_paths = []
+    
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as src:
-            f.save(src.name)
-            input_path = src.name
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as out:
-            compress_pdf(input_path, out.name)
-            return send_file(out.name, as_attachment=True, download_name='compressed.pdf', mimetype='application/pdf')
+        for f in files:
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as src:
+                f.save(src.name)
+                tmp_paths.append(src.name)
+                
+            out_path = src.name + '_compressed.pdf'
+            compress_pdf(src.name, out_path)
+            compressed_paths.append((out_path, f.filename))
+
+        if len(compressed_paths) == 1:
+            # Single file return
+            return send_file(compressed_paths[0][0], as_attachment=True, download_name='compressed.pdf', mimetype='application/pdf')
+        else:
+            # Multiple files -> ZIP
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as zip_out:
+                with zipfile.ZipFile(zip_out.name, 'w') as zf:
+                    for path, original_name in compressed_paths:
+                        zf.write(path, arcname=f"compressed_{original_name}")
+                return send_file(zip_out.name, as_attachment=True, download_name='compressed_files.zip', mimetype='application/zip')
+
     except Exception as e:
         return jsonify({'error': str(e)}), 500
     finally:
-        if 'input_path' in locals() and os.path.exists(input_path):
-            os.unlink(input_path)
+        for p in tmp_paths:
+            if os.path.exists(p):
+                os.unlink(p)
+        for p, _ in compressed_paths:
+            if os.path.exists(p):
+                os.unlink(p)
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
