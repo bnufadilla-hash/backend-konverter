@@ -1,0 +1,13 @@
+Flask
+flask-cors
+gunicorn
+ezdxf
+numpy
+opencv-python-headless
+PyPDF2
+pdf2docx
+pdfplumber
+openpyxl
+python-docx
+reportlab
+pymupdf
