@@ -87,15 +87,24 @@ def pdf_to_xlsx(pdf_path, output_path):
     wb = Workbook()
     ws = wb.active
     ws.title = "PDF"
+    # Using pdfplumber to open the PDF
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
             tables = page.extract_tables()
             if tables:
                 for table in tables:
                     for row in table:
-                        ws.append([str(cell) if cell else "" for cell in row])
-                    ws.append([])
+                        # Clean cell data: handle None and convert to string
+                        cleaned_row = []
+                        for cell in row:
+                            if cell is None:
+                                cleaned_row.append("")
+                            else:
+                                cleaned_row.append(str(cell))
+                        ws.append(cleaned_row)
+                    ws.append([]) # Add empty row between tables
             else:
+                # If no tables, extract text line by line
                 text = page.extract_text() or ""
                 for line in text.splitlines():
                     ws.append([line])
@@ -148,7 +157,9 @@ def merge_pdfs(paths, output_path):
     merger.close()
 
 def compress_pdf(input_path, output_path):
+    # Using fitz (PyMuPDF) to compress PDF
     doc = fitz.open(input_path)
+    # Use garbage=4 (deduplicate objects) and deflate=True (compress streams)
     doc.save(output_path, garbage=4, deflate=True)
     doc.close()
 
@@ -274,40 +285,50 @@ def pdf_convert_route():
     if not target:
         return jsonify({'error': 'Missing target'}), 400
     ext = os.path.splitext(f.filename.lower())[1]
+    
+    input_path = None # Initialize variables for cleanup
+    
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as src:
             f.save(src.name)
             input_path = src.name
+            
         if ext == '.pdf' and target == 'docx':
             with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as out:
                 pdf_to_docx(input_path, out.name)
                 return send_file(out.name, as_attachment=True, download_name='converted.docx', mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
-        if ext == '.pdf' and target == 'xlsx':
+        
+        elif ext == '.pdf' and target == 'xlsx':
             with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as out:
                 pdf_to_xlsx(input_path, out.name)
                 return send_file(out.name, as_attachment=True, download_name='converted.xlsx', mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-        if ext == '.docx' and target == 'pdf':
+        
+        elif ext == '.docx' and target == 'pdf':
             with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as out:
                 docx_to_pdf(input_path, out.name)
                 return send_file(out.name, as_attachment=True, download_name='converted.pdf', mimetype='application/pdf')
-        if ext == '.xlsx' and target == 'pdf':
+        
+        elif ext == '.xlsx' and target == 'pdf':
             with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as out:
                 xlsx_to_pdf(input_path, out.name)
                 return send_file(out.name, as_attachment=True, download_name='converted.pdf', mimetype='application/pdf')
-        return jsonify({'error': 'Unsupported conversion'}), 400
+        
+        else:
+            return jsonify({'error': 'Unsupported conversion'}), 400
+            
     except Exception as e:
         return jsonify({'error': str(e)}), 500
     finally:
-        if 'input_path' in locals() and os.path.exists(input_path):
-            os.unlink(input_path)
+        if input_path and os.path.exists(input_path):
+            try:
+                os.unlink(input_path)
+            except:
+                pass
 
 @app.route('/pdf/compress', methods=['POST'])
 def pdf_compress_route():
     # Handle multiple files or single file
-    files = request.files.getlist('file') # Try 'file' list
-    if not files:
-         # Try 'files' if frontend sends that
-        files = request.files.getlist('files')
+    files = request.files.getlist('files') # Consistent with frontend
     
     if not files:
         return jsonify({'error': 'No file'}), 400
@@ -317,6 +338,11 @@ def pdf_compress_route():
     
     try:
         for f in files:
+            # Use original filename extension
+            ext = os.path.splitext(f.filename)[1].lower()
+            if ext != '.pdf':
+                continue # Skip non-pdfs
+                
             with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as src:
                 f.save(src.name)
                 tmp_paths.append(src.name)
@@ -324,6 +350,9 @@ def pdf_compress_route():
             out_path = src.name + '_compressed.pdf'
             compress_pdf(src.name, out_path)
             compressed_paths.append((out_path, f.filename))
+
+        if not compressed_paths:
+             return jsonify({'error': 'No valid PDF files processed'}), 400
 
         if len(compressed_paths) == 1:
             # Single file return
@@ -341,10 +370,16 @@ def pdf_compress_route():
     finally:
         for p in tmp_paths:
             if os.path.exists(p):
-                os.unlink(p)
+                try:
+                    os.unlink(p)
+                except:
+                    pass
         for p, _ in compressed_paths:
             if os.path.exists(p):
-                os.unlink(p)
+                try:
+                    os.unlink(p)
+                except:
+                    pass
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
