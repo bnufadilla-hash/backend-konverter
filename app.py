@@ -178,11 +178,11 @@ def merge_pdfs(paths, output_path):
     merger.close()
 
 def compress_pdf(input_path, output_path):
-    logger.info(f"Starting aggressive compression for {input_path}")
+    logger.info(f"Starting extremely aggressive compression for {input_path}")
     try:
         doc = fitz.open(input_path)
         
-        # 1. Font subsetting (standard optimization)
+        # 1. Font subsetting
         try:
             doc.subset_fonts()
         except Exception:
@@ -200,33 +200,33 @@ def compress_pdf(input_path, output_path):
                 try:
                     pix = fitz.Pixmap(doc, xref)
                     
-                    # 2. Downsample large images (> 800px)
-                    if pix.width > 800 or pix.height > 800:
-                        # Convert to RGB if needed (e.g. CMYK)
-                        if pix.n >= 4:
-                            pix = fitz.Pixmap(fitz.csRGB, pix)
-                        
-                        scale = 800 / max(pix.width, pix.height)
+                    # 2. Convert to Grayscale (3x faster, 3x smaller)
+                    # Do this BEFORE resizing to save memory
+                    if pix.n >= 3: # RGB or CMYK
+                        try:
+                            pix = fitz.Pixmap(fitz.csGRAY, pix)
+                        except Exception:
+                            pass
+                    
+                    # 3. Resize Limit: 600px
+                    if pix.width > 600 or pix.height > 600:
+                        scale = 600 / max(pix.width, pix.height)
                         new_w = int(pix.width * scale)
                         new_h = int(pix.height * scale)
                         pix = fitz.Pixmap(pix, new_w, new_h)
-                    
-                    # 3. Force JPEG conversion with low quality (40)
-                    # Convert to RGB if it's not already (e.g. PNG with alpha)
-                    if pix.n >= 4: # CMYK
-                        pix = fitz.Pixmap(fitz.csRGB, pix)
-                    elif pix.alpha: # Has alpha channel
-                        # Blend with white background to save as JPEG
+
+                    # 4. Handle Alpha (JPEG doesn't support transparency)
+                    if pix.alpha:
                         try:
-                            pix_rgb = fitz.Pixmap(fitz.csRGB, pix.irect, False)
-                            pix_rgb.clear_with(255)
-                            pix_rgb.overlay(pix, pix.irect)
-                            pix = pix_rgb
+                            pix_no_alpha = fitz.Pixmap(fitz.csGRAY, pix.irect, False)
+                            pix_no_alpha.clear_with(255)
+                            pix_no_alpha.overlay(pix, pix.irect)
+                            pix = pix_no_alpha
                         except:
                             pass
-
-                    # Compress to JPEG quality 40
-                    new_data = pix.tobytes("jpeg", jpg_quality=40)
+                            
+                    # 5. Force JPEG with Quality 25
+                    new_data = pix.tobytes("jpeg", jpg_quality=25)
                     doc.update_image(xref, data=new_data)
                     
                     pix = None # free memory
@@ -234,10 +234,10 @@ def compress_pdf(input_path, output_path):
                     logger.warning(f"Image compression skipped for xref {xref}: {e}")
                     pass
 
-        # 4. Garbage collection & Deflate & Clean
+        # 6. Garbage collection & Deflate & Clean
         doc.save(output_path, garbage=4, deflate=True, clean=True)
         doc.close()
-        logger.info(f"Aggressive compression successful: {output_path}")
+        logger.info(f"Extremely aggressive compression successful: {output_path}")
         
     except Exception as e:
         logger.error(f"Compression failed: {e}")
