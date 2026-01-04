@@ -327,17 +327,25 @@ def pdf_convert_route():
 
 @app.route('/pdf/compress', methods=['POST'])
 def pdf_compress_route():
-    # Handle multiple files or single file
-    files = request.files.getlist('files') # Consistent with frontend
+    # Try getting 'files' list first (for multiple files)
+    files = request.files.getlist('files')
+    
+    # If empty, try 'file' (fallback for single file upload from some clients)
+    if not files:
+        files = request.files.getlist('file')
     
     if not files:
-        return jsonify({'error': 'No file'}), 400
+        return jsonify({'error': 'No file uploaded'}), 400
         
     tmp_paths = []
     compressed_paths = []
     
     try:
         for f in files:
+            # Check filename exists
+            if not f.filename:
+                continue
+                
             # Use original filename extension
             ext = os.path.splitext(f.filename)[1].lower()
             if ext != '.pdf':
@@ -352,7 +360,7 @@ def pdf_compress_route():
             compressed_paths.append((out_path, f.filename))
 
         if not compressed_paths:
-             return jsonify({'error': 'No valid PDF files processed'}), 400
+             return jsonify({'error': 'No valid PDF files processed. Please upload PDF files.'}), 400
 
         if len(compressed_paths) == 1:
             # Single file return
@@ -366,21 +374,21 @@ def pdf_compress_route():
                 return send_file(zip_out.name, as_attachment=True, download_name='compressed_files.zip', mimetype='application/zip')
 
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        # Log error for debugging (in production logging would be better)
+        print(f"Compression error: {str(e)}")
+        return jsonify({'error': f"Compression failed: {str(e)}"}), 500
     finally:
+        # Cleanup temporary input files
         for p in tmp_paths:
             if os.path.exists(p):
                 try:
                     os.unlink(p)
                 except:
                     pass
-        for p, _ in compressed_paths:
-            if os.path.exists(p):
-                try:
-                    os.unlink(p)
-                except:
-                    pass
-
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+        # Cleanup temporary output files (only if they are not being streamed)
+        # Note: send_file keeps the file handle open, so we rely on OS or specific Flask configs for cleanup usually.
+        # However, for temp files created with delete=False, we should clean them up.
+        # But cleaning up immediately after return send_file might fail if file is still in use.
+        # A common strategy is to use after_request or a background task, but simple tempfile is hard to clean perfectly in basic Flask.
+        # For this snippet, we leave the output files. In a production app, use a proper temp directory lifecycle.
+        pass
