@@ -1,4 +1,4 @@
-Flask
+doc.save(output_path, garbage=4, deflate=True, clean=True)doc.save(output_path, garbage=4, deflate=True, clean=True)Flask
 flask-cors
 gunicorn
 ezdxf
