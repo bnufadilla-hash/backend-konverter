@@ -22,6 +22,7 @@ import zipfile
 import logging
 import sys
 import gc
+import io
 
 # Configure logging
 logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
@@ -207,8 +208,55 @@ def compress_pdf(input_path, output_path):
                         logger.warning(f"Skipped huge image {xref} to save RAM: {e}")
                         continue
                     
+                    # 4. Handle Alpha (JPEG doesn't support transparency)
+                    # Use Pillow for robust alpha handling (avoiding PyMuPDF overlay issues)
+                    if pix.alpha:
+                        try:
+                            # Convert to bytes
+                            img_data = pix.tobytes()
+                            # Load in Pillow
+                            pil_img = Image.open(io.BytesIO(img_data))
+                            
+                            # Create white background
+                            bg = Image.new("RGB", pil_img.size, (255, 255, 255))
+                            # Paste using alpha channel as mask
+                            # Handle different modes
+                            if pil_img.mode in ('RGBA', 'LA'):
+                                bg.paste(pil_img, mask=pil_img.split()[-1])
+                            else:
+                                bg.paste(pil_img)
+                            
+                            # Convert to Grayscale (L) for aggressive compression
+                            pil_img = bg.convert("L")
+                            
+                            # Resize Limit: 400px (Aggressive) via Pillow
+                            if pil_img.width > 400 or pil_img.height > 400:
+                                pil_img.thumbnail((400, 400), Image.Resampling.LANCZOS)
+                                
+                            # Save as JPEG with quality 20
+                            out_buffer = io.BytesIO()
+                            pil_img.save(out_buffer, format="JPEG", quality=20)
+                            new_data = out_buffer.getvalue()
+                            
+                            # Update PDF
+                            doc.update_image(xref, data=new_data)
+                            
+                            # Skip standard processing since we handled it
+                            pix = None
+                            new_data = None
+                            image_count += 1
+                            if image_count % 5 == 0:
+                                gc.collect()
+                            continue
+                            
+                        except Exception as e:
+                            logger.warning(f"Pillow alpha handling failed: {e}")
+                            # Fallback to standard processing if Pillow fails
+                            pass
+
+                    # Standard Processing (No Alpha or Pillow failed)
+                    
                     # 2. Convert to Grayscale (3x faster, 3x smaller)
-                    # Do this BEFORE resizing to save memory
                     if pix.n >= 3: # RGB or CMYK
                         try:
                             pix = fitz.Pixmap(fitz.csGRAY, pix)
@@ -216,33 +264,16 @@ def compress_pdf(input_path, output_path):
                             pass
                     
                     # 3. Resize Limit: 400px (Aggressive)
-                    # Force resize if larger than 400px
                     if pix.width > 400 or pix.height > 400:
                         scale = 400 / max(pix.width, pix.height)
                         new_w = int(pix.width * scale)
                         new_h = int(pix.height * scale)
                         pix = fitz.Pixmap(pix, new_w, new_h)
-
-                    # 4. Handle Alpha (JPEG doesn't support transparency)
-                    if pix.alpha:
-                        try:
-                            # Must create a new Pixmap without alpha (RGB) first
-                            # Using 'pix.irect' for dimensions and 'False' for no alpha
-                            # Convert to RGB (csRGB) first because JPEG doesn't support Grayscale+Alpha well in some libraries
-                            pix_rgb = fitz.Pixmap(fitz.csRGB, pix.irect, False)
-                            pix_rgb.clear_with(255) # White background
-                            pix_rgb.overlay(pix, pix.irect)
                             
-                            # Now convert to Grayscale if we want grayscale output
-                            pix = fitz.Pixmap(fitz.csGRAY, pix_rgb)
-                        except Exception as e:
-                            logger.warning(f"Alpha handling failed: {e}")
-                            pass
-                            
-                    # 5. Force JPEG with Quality 20 (Lowest acceptable)
+                    # 5. Force JPEG with Quality 20
                     new_data = pix.tobytes("jpeg", jpg_quality=20)
                     
-                    # Robust update (try both methods)
+                    # Robust update
                     try:
                         doc.update_image(xref, data=new_data)
                     except AttributeError:
@@ -261,7 +292,7 @@ def compress_pdf(input_path, output_path):
                     logger.warning(f"Image compression skipped for xref {xref}: {e}")
                     pass
 
-        # 6. Garbage collection & Deflate & Clean (Linear removed due to incompatibility)
+        # 6. Garbage collection & Deflate & Clean
         doc.save(output_path, garbage=4, deflate=True, clean=True)
         doc.close()
         logger.info(f"Extremely aggressive compression successful: {output_path}")
