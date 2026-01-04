@@ -180,60 +180,27 @@ def merge_pdfs(paths, output_path):
 def compress_pdf(input_path, output_path):
     logger.info(f"Starting compression for {input_path}")
     try:
+        # Optimized for speed and memory to prevent timeouts on Free Tier
+        # Removed complex image downsampling which caused timeouts
         doc = fitz.open(input_path)
         
-        # Subset fonts
-        try:
-            doc.subset_fonts()
-        except Exception as e:
-            logger.warning(f"Font subsetting failed: {e}")
-
-        processed_xrefs = set()
-        
-        for page in doc:
-            for img in page.get_images():
-                xref = img[0]
-                if xref in processed_xrefs:
-                    continue
-                processed_xrefs.add(xref)
-                
-                try:
-                    pix = fitz.Pixmap(doc, xref)
-                    
-                    if pix.width > 1024 or pix.height > 1024:
-                        if pix.n >= 4:
-                            pix = fitz.Pixmap(fitz.csRGB, pix)
-                        
-                        scale = 1024 / max(pix.width, pix.height)
-                        if scale < 0.9: 
-                            new_w = int(pix.width * scale)
-                            new_h = int(pix.height * scale)
-                            pix = fitz.Pixmap(pix, new_w, new_h)
-                    
-                    if pix.n < 3 and pix.alpha == 0: 
-                        pass
-                    
-                    new_data = pix.tobytes("jpeg", jpg_quality=60)
-                    doc.update_image(xref, data=new_data)
-                    
-                    pix = None 
-                except Exception as e:
-                    logger.warning(f"Image compression skipped for xref {xref}: {e}")
-                    pass
-
-        doc.save(output_path, garbage=4, deflate=True, clean=True)
+        # Use simple but effective compression
+        # garbage=4: removes unused objects
+        # deflate=True: compresses streams
+        doc.save(output_path, garbage=4, deflate=True)
         doc.close()
+        
         logger.info(f"Compression successful: {output_path}")
         
     except Exception as e:
-        logger.error(f"Advanced compression failed: {e}")
+        logger.error(f"Compression failed: {e}")
+        # Ensure resources are released
         try:
-            doc = fitz.open(input_path)
-            doc.save(output_path, garbage=4, deflate=True)
-            doc.close()
-        except Exception as fallback_error:
-            logger.error(f"Fallback compression failed: {fallback_error}")
-            raise fallback_error
+            if 'doc' in locals():
+                doc.close()
+        except:
+            pass
+        raise e
 
 def pdf_to_image(pdf_path, image_path):
     doc = fitz.open(pdf_path)
