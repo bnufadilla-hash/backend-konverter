@@ -23,20 +23,39 @@ app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
 
 def image_to_dxf(image_path, output_path):
-    # Read image
-    img = cv2.imread(image_path)
+    # Read image with alpha channel support (IMREAD_UNCHANGED)
+    img = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
     if img is None:
         raise ValueError("Could not read image")
+    
+    # Handle Transparency: Convert to white background
+    if img.shape[2] == 4:
+        # Create white background
+        bg = np.ones_like(img[:,:,:3]) * 255
+        # Extract alpha channel
+        alpha = img[:,:,3] / 255.0
+        # Blend
+        for c in range(3):
+            bg[:,:,c] = bg[:,:,c] * (1 - alpha) + img[:,:,c] * alpha
+        img = bg.astype(np.uint8)
     
     # Convert to grayscale
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
-    # Edge detection using Canny
-    # Adjust thresholds as needed
-    edges = cv2.Canny(gray, 50, 150)
+    # Reduce noise with Gaussian Blur
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     
-    # Find contours
-    contours, hierarchy = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Auto Canny Thresholds
+    v = np.median(blurred)
+    sigma = 0.33
+    lower = int(max(0, (1.0 - sigma) * v))
+    upper = int(min(255, (1.0 + sigma) * v))
+    
+    # Edge detection
+    edges = cv2.Canny(blurred, lower, upper)
+    
+    # Find contours - Use RETR_LIST to capture all contours (inner and outer)
+    contours, hierarchy = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     
     # Create DXF document
     doc = ezdxf.new('R2010')
@@ -46,17 +65,16 @@ def image_to_dxf(image_path, output_path):
     
     for contour in contours:
         # contour is a numpy array of shape (n, 1, 2)
-        # ezdxf expects a list of (x, y) tuples
-        # We need to flip Y because image coordinates (0,0) is top-left, 
-        # while CAD (0,0) is usually bottom-left or center.
-        # Here we just mirror Y to keep orientation consistent visually
+        if len(contour) < 2:
+            continue
+            
         points = []
         for point in contour:
             x, y = point[0]
+            # Flip Y for CAD (image 0,0 is top-left, CAD is bottom-left)
             points.append((float(x), float(height - y)))
             
-        if len(points) > 1:
-            msp.add_lwpolyline(points)
+        msp.add_lwpolyline(points)
             
     doc.saveas(output_path)
 
