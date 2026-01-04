@@ -21,6 +21,7 @@ from PIL import Image
 import zipfile
 import logging
 import sys
+import gc
 
 # Configure logging
 logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
@@ -189,6 +190,7 @@ def compress_pdf(input_path, output_path):
             pass
 
         processed_xrefs = set()
+        image_count = 0
         
         for page in doc:
             for img in page.get_images():
@@ -198,7 +200,12 @@ def compress_pdf(input_path, output_path):
                 processed_xrefs.add(xref)
                 
                 try:
-                    pix = fitz.Pixmap(doc, xref)
+                    # MEMORY SAFEGUARD: Try to load image
+                    try:
+                        pix = fitz.Pixmap(doc, xref)
+                    except Exception as e:
+                        logger.warning(f"Skipped huge image {xref} to save RAM: {e}")
+                        continue
                     
                     # 2. Convert to Grayscale (3x faster, 3x smaller)
                     # Do this BEFORE resizing to save memory
@@ -241,12 +248,20 @@ def compress_pdf(input_path, output_path):
                     except AttributeError:
                         pass
                     
-                    pix = None # free memory
+                    # FREE RAM INSTANTLY
+                    pix = None 
+                    new_data = None
+                    image_count += 1
+                    
+                    # Explicit Garbage Collection every 5 images
+                    if image_count % 5 == 0:
+                        gc.collect()
+                        
                 except Exception as e:
                     logger.warning(f"Image compression skipped for xref {xref}: {e}")
                     pass
 
-        # 6. Garbage collection & Deflate & Clean
+        # 6. Garbage collection & Deflate & Clean (Linear removed due to incompatibility)
         doc.save(output_path, garbage=4, deflate=True, clean=True)
         doc.close()
         logger.info(f"Extremely aggressive compression successful: {output_path}")
