@@ -219,11 +219,17 @@ def compress_pdf(input_path, output_path):
                     # 4. Handle Alpha (JPEG doesn't support transparency)
                     if pix.alpha:
                         try:
-                            pix_no_alpha = fitz.Pixmap(fitz.csGRAY, pix.irect, False)
-                            pix_no_alpha.clear_with(255)
-                            pix_no_alpha.overlay(pix, pix.irect)
-                            pix = pix_no_alpha
-                        except:
+                            # Must create a new Pixmap without alpha (RGB) first
+                            # Using 'pix.irect' for dimensions and 'False' for no alpha
+                            # Convert to RGB (csRGB) first because JPEG doesn't support Grayscale+Alpha well in some libraries
+                            pix_rgb = fitz.Pixmap(fitz.csRGB, pix.irect, False)
+                            pix_rgb.clear_with(255) # White background
+                            pix_rgb.overlay(pix, pix.irect)
+                            
+                            # Now convert to Grayscale if we want grayscale output
+                            pix = fitz.Pixmap(fitz.csGRAY, pix_rgb)
+                        except Exception as e:
+                            logger.warning(f"Alpha handling failed: {e}")
                             pass
                             
                     # 5. Force JPEG with Quality 20 (Lowest acceptable)
@@ -233,9 +239,6 @@ def compress_pdf(input_path, output_path):
                     try:
                         doc.update_image(xref, data=new_data)
                     except AttributeError:
-                        # Fallback for older pymupdf versions if update_image is missing
-                        # Note: This is a partial fallback; correct way is complicated without update_image.
-                        # But since user requested update, we assume it works or we skip.
                         pass
                     
                     pix = None # free memory
@@ -243,8 +246,8 @@ def compress_pdf(input_path, output_path):
                     logger.warning(f"Image compression skipped for xref {xref}: {e}")
                     pass
 
-        # 6. Garbage collection & Deflate & Clean & Linear
-        doc.save(output_path, garbage=4, deflate=True, clean=True, linear=True)
+        # 6. Garbage collection & Deflate & Clean
+        doc.save(output_path, garbage=4, deflate=True, clean=True)
         doc.close()
         logger.info(f"Extremely aggressive compression successful: {output_path}")
         
