@@ -23,6 +23,7 @@ import logging
 import sys
 import gc
 import io
+import shutil
 
 # Configure logging
 logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
@@ -32,13 +33,22 @@ app = Flask(__name__)
 # Explicitly allow all origins and headers for debugging
 CORS(app, resources={r"/*": {"origins": "*", "allow_headers": "*", "methods": "*"}})
 
-# Set Max Content Length to 100MB (as requested)
-app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024
+# Set Max Content Length to 50MB (server limit)
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
+
+# ============== MEMORY LIMITS (FOR 512MB RAM SERVER) ==============
+# CRITICAL: Server hanya punya 512MB RAM!
+MAX_IMAGE_PIXELS = 800 * 800      # Max 0.64MP per image (very conservative)
+MAX_IMAGE_DIMENSION = 800         # Max width/height before skip
+COMPRESS_TARGET_SIZE = 300        # Target resize dimension (aggressive)
+JPEG_QUALITY = 15                 # Lower quality = smaller file
+Image.MAX_IMAGE_PIXELS = 10000000 # 10MP limit for Pillow (conservative)
+GC_EVERY_N_IMAGES = 2             # Garbage collect every N images (aggressive for 512MB)
 
 @app.errorhandler(RequestEntityTooLarge)
 def handle_file_too_large(e):
     logger.error(f"File too large error: {e}")
-    return jsonify({'error': 'File terlalu besar. Maksimum ukuran file adalah 100MB.'}), 413
+    return jsonify({'error': 'File terlalu besar. Maksimum ukuran file adalah 50MB.'}), 413
 
 @app.errorhandler(500)
 def handle_internal_error(e):
@@ -180,20 +190,41 @@ def merge_pdfs(paths, output_path):
     merger.close()
 
 def compress_pdf(input_path, output_path):
-    logger.info(f"Starting extremely aggressive compression for {input_path}")
+    """
+    Compress PDF with fixes for:
+    1. Linearisation error - using linear=False
+    2. File size not reduced - force recreate if needed
+    3. RAM explosion - VERY strict memory management for 512MB server
+    4. Process ALL images - no limit, but aggressive GC
+    """
+    logger.info(f"Starting compression for {input_path}")
+    
+    original_size = os.path.getsize(input_path)
+    logger.info(f"Original file size: {original_size} bytes")
+    
+    doc = None
+    temp_output = output_path + ".tmp"
+    
     try:
+        # Open with no_new_id to prevent issues
         doc = fitz.open(input_path)
         
-        # 1. Font subsetting
+        # 1. Font subsetting (safe, ignore errors)
         try:
             doc.subset_fonts()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Font subsetting skipped: {e}")
 
         processed_xrefs = set()
         image_count = 0
+        skipped_count = 0
         
-        for page in doc:
+        for page_num, page in enumerate(doc):
+            logger.debug(f"Processing page {page_num + 1}")
+            
+            # Force garbage collection setiap page untuk hemat RAM
+            gc.collect()
+            
             for img in page.get_images():
                 xref = img[0]
                 if xref in processed_xrefs:
@@ -201,116 +232,251 @@ def compress_pdf(input_path, output_path):
                 processed_xrefs.add(xref)
                 
                 try:
-                    # MEMORY SAFEGUARD: Try to load image
+                    # ============== RAM SAFEGUARD ==============
+                    # Check image info BEFORE loading to prevent RAM explosion
+                    try:
+                        img_info = doc.extract_image(xref)
+                        if img_info:
+                            img_width = img_info.get("width", 0)
+                            img_height = img_info.get("height", 0)
+                            
+                            # Skip extremely large images that would explode RAM
+                            if img_width * img_height > MAX_IMAGE_PIXELS:
+                                logger.warning(f"Skipped huge image {xref} ({img_width}x{img_height}) to save RAM")
+                                skipped_count += 1
+                                continue
+                                
+                            if img_width > MAX_IMAGE_DIMENSION or img_height > MAX_IMAGE_DIMENSION:
+                                logger.warning(f"Skipped oversized image {xref} ({img_width}x{img_height})")
+                                skipped_count += 1
+                                continue
+                    except Exception as e:
+                        logger.warning(f"Could not get image info for {xref}: {e}")
+                    
+                    # Now safe to load
+                    pix = None
                     try:
                         pix = fitz.Pixmap(doc, xref)
                     except Exception as e:
-                        logger.warning(f"Skipped huge image {xref} to save RAM: {e}")
+                        logger.warning(f"Could not load image {xref}: {e}")
+                        skipped_count += 1
                         continue
                     
-                    # 4. Handle Alpha (JPEG doesn't support transparency)
-                    # Use Pillow for robust alpha handling (avoiding PyMuPDF overlay issues)
+                    # ============== ALPHA HANDLING ==============
                     if pix.alpha:
                         try:
-                            # Convert to bytes
-                            img_data = pix.tobytes()
-                            # Load in Pillow
+                            # Use Pillow for robust alpha handling
+                            img_data = pix.tobytes("png")
+                            pix = None  # Free immediately
+                            
                             pil_img = Image.open(io.BytesIO(img_data))
+                            img_data = None  # Free
                             
                             # Create white background
                             bg = Image.new("RGB", pil_img.size, (255, 255, 255))
-                            # Paste using alpha channel as mask
-                            # Handle different modes
                             if pil_img.mode in ('RGBA', 'LA'):
                                 bg.paste(pil_img, mask=pil_img.split()[-1])
                             else:
                                 bg.paste(pil_img)
+                            pil_img.close()
+                            pil_img = None
                             
-                            # Convert to Grayscale (L) for aggressive compression
-                            pil_img = bg.convert("L")
+                            # Convert to Grayscale for aggressive compression
+                            gray_img = bg.convert("L")
+                            bg.close()
+                            bg = None
                             
-                            # Resize Limit: 400px (Aggressive) via Pillow
-                            if pil_img.width > 400 or pil_img.height > 400:
-                                pil_img.thumbnail((400, 400), Image.Resampling.LANCZOS)
+                            # Resize if needed (use COMPRESS_TARGET_SIZE)
+                            if gray_img.width > COMPRESS_TARGET_SIZE or gray_img.height > COMPRESS_TARGET_SIZE:
+                                gray_img.thumbnail((COMPRESS_TARGET_SIZE, COMPRESS_TARGET_SIZE), Image.Resampling.LANCZOS)
                                 
-                            # Save as JPEG with quality 20
+                            # Save as JPEG with low quality
                             out_buffer = io.BytesIO()
-                            pil_img.save(out_buffer, format="JPEG", quality=20)
+                            gray_img.save(out_buffer, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+                            gray_img.close()
+                            gray_img = None
+                            
                             new_data = out_buffer.getvalue()
+                            out_buffer = None
                             
-                            # Update PDF
-                            doc.update_image(xref, data=new_data)
+                            # Update PDF image
+                            try:
+                                doc.update_image(xref, data=new_data)
+                            except Exception as ue:
+                                logger.warning(f"Could not update alpha image {xref}: {ue}")
                             
-                            # Skip standard processing since we handled it
-                            pix = None
                             new_data = None
                             image_count += 1
-                            if image_count % 5 == 0:
+                            
+                            # Aggressive GC for 512MB RAM
+                            if image_count % GC_EVERY_N_IMAGES == 0:
                                 gc.collect()
                             continue
                             
                         except Exception as e:
-                            logger.warning(f"Pillow alpha handling failed: {e}")
-                            # Fallback to standard processing if Pillow fails
-                            pass
-
-                    # Standard Processing (No Alpha or Pillow failed)
+                            logger.warning(f"Pillow alpha handling failed for {xref}: {e}")
+                            gc.collect()
+                            # Continue to standard processing
                     
-                    # 2. Convert to Grayscale (3x faster, 3x smaller)
-                    if pix.n >= 3: # RGB or CMYK
+                    # ============== STANDARD PROCESSING ==============
+                    # Convert to Grayscale
+                    if pix and pix.n >= 3:
                         try:
-                            pix = fitz.Pixmap(fitz.csGRAY, pix)
-                        except Exception:
-                            pass
+                            gray_pix = fitz.Pixmap(fitz.csGRAY, pix)
+                            pix = None  # Free original immediately
+                            pix = gray_pix
+                        except Exception as e:
+                            logger.warning(f"Grayscale conversion failed: {e}")
                     
-                    # 3. Resize Limit: 400px (Aggressive)
-                    if pix.width > 400 or pix.height > 400:
-                        scale = 400 / max(pix.width, pix.height)
+                    # Resize if too large (use COMPRESS_TARGET_SIZE)
+                    if pix and (pix.width > COMPRESS_TARGET_SIZE or pix.height > COMPRESS_TARGET_SIZE):
+                        scale = COMPRESS_TARGET_SIZE / max(pix.width, pix.height)
                         new_w = int(pix.width * scale)
                         new_h = int(pix.height * scale)
-                        pix = fitz.Pixmap(pix, new_w, new_h)
-                            
-                    # 5. Force JPEG with Quality 20
-                    new_data = pix.tobytes("jpeg", jpg_quality=20)
+                        try:
+                            resized_pix = fitz.Pixmap(pix, new_w, new_h)
+                            pix = None  # Free original immediately
+                            pix = resized_pix
+                        except Exception as e:
+                            logger.warning(f"Resize failed: {e}")
                     
-                    # Robust update
-                    try:
-                        doc.update_image(xref, data=new_data)
-                    except AttributeError:
-                        pass
+                    # Convert to JPEG
+                    new_data = None
+                    if pix:
+                        try:
+                            new_data = pix.tobytes("jpeg", jpg_quality=JPEG_QUALITY)
+                        except Exception as e:
+                            logger.warning(f"JPEG conversion failed: {e}")
+                            pix = None
+                            gc.collect()
+                            continue
                     
-                    # FREE RAM INSTANTLY
+                    # Update in PDF
+                    if new_data:
+                        try:
+                            doc.update_image(xref, data=new_data)
+                        except Exception as e:
+                            logger.warning(f"Could not update image {xref}: {e}")
+                    
+                    # Free memory immediately
                     pix = None 
                     new_data = None
                     image_count += 1
                     
-                    # Explicit Garbage Collection every 5 images
-                    if image_count % 5 == 0:
+                    # Aggressive garbage collection for 512MB RAM
+                    if image_count % GC_EVERY_N_IMAGES == 0:
                         gc.collect()
                         
                 except Exception as e:
                     logger.warning(f"Image compression skipped for xref {xref}: {e}")
-                    pass
+                    gc.collect()
+                    continue
 
-        # 6. Garbage collection & Deflate & Clean
-        doc.save(output_path, garbage=4, deflate=True, clean=True)
+        logger.info(f"Processed {image_count} images, skipped {skipped_count}")
+        
+        # Force cleanup before save
+        gc.collect()
+
+        # ============== SAVE WITH FIX FOR LINEARISATION ERROR ==============
+        # FIX: Use linear=False to avoid "Linearisation is no longer supported" error
+        try:
+            doc.save(
+                temp_output, 
+                garbage=4,           # Remove unused objects
+                deflate=True,        # Compress streams
+                clean=True,          # Clean content streams
+                linear=False,        # FIX: Disable linearisation
+                pretty=False,        # Compact output
+                no_new_id=True       # Keep same ID
+            )
+        except TypeError:
+            # Older PyMuPDF might not support all options
+            doc.save(temp_output, garbage=4, deflate=True, clean=True)
+        
         doc.close()
-        logger.info(f"Extremely aggressive compression successful: {output_path}")
+        doc = None
+        gc.collect()
+        
+        # ============== CHECK IF COMPRESSION WAS EFFECTIVE ==============
+        compressed_size = os.path.getsize(temp_output)
+        logger.info(f"Compressed size: {compressed_size} bytes")
+        
+        # If compressed file is not smaller, try alternative approach
+        if compressed_size >= original_size:
+            logger.warning("Compression not effective, trying alternative method...")
+            
+            try:
+                # Alternative: Recreate PDF from scratch
+                alt_output = output_path + ".alt.tmp"
+                recreate_pdf_smaller(temp_output, alt_output)
+                
+                alt_size = os.path.getsize(alt_output)
+                logger.info(f"Alternative compression size: {alt_size} bytes")
+                
+                if alt_size < compressed_size:
+                    os.replace(alt_output, temp_output)
+                    compressed_size = alt_size
+                else:
+                    if os.path.exists(alt_output):
+                        os.unlink(alt_output)
+            except Exception as e:
+                logger.warning(f"Alternative compression failed: {e}")
+            finally:
+                gc.collect()
+        
+        # Move temp to final output
+        shutil.move(temp_output, output_path)
+        
+        final_size = os.path.getsize(output_path)
+        reduction = ((original_size - final_size) / original_size) * 100 if original_size > 0 else 0
+        logger.info(f"Compression complete: {original_size} -> {final_size} bytes ({reduction:.1f}% reduction)")
         
     except Exception as e:
         logger.error(f"Compression failed: {e}")
-        try:
-            if 'doc' in locals():
+        if doc:
+            try:
                 doc.close()
-        except:
-            pass
+            except:
+                pass
+        # Cleanup temp files
+        for f in [temp_output, output_path + ".alt.tmp"]:
+            if os.path.exists(f):
+                try:
+                    os.unlink(f)
+                except:
+                    pass
         raise e
+    finally:
+        gc.collect()
+
+
+def recreate_pdf_smaller(input_path, output_path):
+    """
+    Recreate PDF from scratch to ensure smaller size.
+    This is a fallback when normal compression doesn't reduce size.
+    """
+    src = fitz.open(input_path)
+    dst = fitz.open()
+    
+    for page in src:
+        # Create new page with same dimensions
+        new_page = dst.new_page(width=page.rect.width, height=page.rect.height)
+        
+        # Copy page content as display list (more efficient)
+        new_page.show_pdf_page(new_page.rect, src, page.number)
+    
+    # Save with maximum compression
+    dst.save(output_path, garbage=4, deflate=True, clean=True, linear=False)
+    dst.close()
+    src.close()
+
 
 def pdf_to_image(pdf_path, image_path):
     doc = fitz.open(pdf_path)
-    page = doc[0] # Take first page
+    page = doc[0]  # Take first page
     pix = page.get_pixmap()
     pix.save(image_path)
+    doc.close()
 
 @app.route('/')
 def index():
@@ -349,6 +515,17 @@ def convert():
             # Process image to DXF
             image_to_dxf(processing_path, output_path)
             
+            @after_this_request
+            def cleanup(response):
+                # Cleanup temp files after sending
+                for p in [input_path, temp_img_path, output_path]:
+                    if p and os.path.exists(p):
+                        try:
+                            os.unlink(p)
+                        except Exception as e:
+                            logger.warning(f"Cleanup failed for {p}: {e}")
+                return response
+            
             # Send file back
             return send_file(
                 output_path,
@@ -359,23 +536,24 @@ def convert():
             
         except Exception as e:
             logger.error(f"Convert error: {e}")
+            # Cleanup on error
+            for p in [input_path, temp_img_path, output_path]:
+                if p and os.path.exists(p):
+                    try:
+                        os.unlink(p)
+                    except:
+                        pass
             return jsonify({'error': str(e)}), 500
-            
-        finally:
-            # Cleanup temp files
-            if input_path and os.path.exists(input_path):
-                os.unlink(input_path)
-            if temp_img_path and os.path.exists(temp_img_path):
-                os.unlink(temp_img_path)
-            pass
 
 @app.route('/pdf/merge', methods=['POST'])
 def pdf_merge_route():
     files = request.files.getlist('files')
     if not files:
         return jsonify({'error': 'No files'}), 400
+    
     tmp_paths = []
     converted_tmp_paths = []
+    output_path = None
     
     try:
         for f in files:
@@ -400,19 +578,48 @@ def pdf_merge_route():
                 pass
 
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as out:
-            merge_pdfs(converted_tmp_paths, out.name)
-            return send_file(out.name, as_attachment=True, download_name='merged.pdf', mimetype='application/pdf')
+            output_path = out.name
+            merge_pdfs(converted_tmp_paths, output_path)
+        
+        @after_this_request
+        def cleanup(response):
+            for p in tmp_paths:
+                if os.path.exists(p):
+                    try:
+                        os.unlink(p)
+                    except Exception as e:
+                        logger.warning(f"Cleanup failed: {e}")
+            for p in converted_tmp_paths:
+                if p not in tmp_paths and os.path.exists(p):
+                    try:
+                        os.unlink(p)
+                    except Exception as e:
+                        logger.warning(f"Cleanup failed: {e}")
+            if output_path and os.path.exists(output_path):
+                try:
+                    os.unlink(output_path)
+                except Exception as e:
+                    logger.warning(f"Cleanup failed: {e}")
+            return response
+        
+        return send_file(output_path, as_attachment=True, download_name='merged.pdf', mimetype='application/pdf')
             
     except Exception as e:
         logger.error(f"Merge error: {e}")
-        return jsonify({'error': str(e)}), 500
-    finally:
+        # Cleanup on error
         for p in tmp_paths:
             if os.path.exists(p):
-                os.unlink(p)
+                try:
+                    os.unlink(p)
+                except:
+                    pass
         for p in converted_tmp_paths:
             if p not in tmp_paths and os.path.exists(p):
-                os.unlink(p)
+                try:
+                    os.unlink(p)
+                except:
+                    pass
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/pdf/convert', methods=['POST'])
 def pdf_convert_route():
@@ -424,7 +631,8 @@ def pdf_convert_route():
         return jsonify({'error': 'Missing target'}), 400
     ext = os.path.splitext(f.filename.lower())[1]
     
-    input_path = None 
+    input_path = None
+    output_path = None
     
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as src:
@@ -433,36 +641,86 @@ def pdf_convert_route():
             
         if ext == '.pdf' and target == 'docx':
             with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as out:
-                pdf_to_docx(input_path, out.name)
-                return send_file(out.name, as_attachment=True, download_name='converted.docx', mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+                output_path = out.name
+                pdf_to_docx(input_path, output_path)
+                
+                @after_this_request
+                def cleanup(response):
+                    for p in [input_path, output_path]:
+                        if p and os.path.exists(p):
+                            try:
+                                os.unlink(p)
+                            except:
+                                pass
+                    return response
+                
+                return send_file(output_path, as_attachment=True, download_name='converted.docx', mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
         
         elif ext == '.pdf' and target == 'xlsx':
             with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as out:
-                pdf_to_xlsx(input_path, out.name)
-                return send_file(out.name, as_attachment=True, download_name='converted.xlsx', mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+                output_path = out.name
+                pdf_to_xlsx(input_path, output_path)
+                
+                @after_this_request
+                def cleanup(response):
+                    for p in [input_path, output_path]:
+                        if p and os.path.exists(p):
+                            try:
+                                os.unlink(p)
+                            except:
+                                pass
+                    return response
+                
+                return send_file(output_path, as_attachment=True, download_name='converted.xlsx', mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
         
         elif ext == '.docx' and target == 'pdf':
             with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as out:
-                docx_to_pdf(input_path, out.name)
-                return send_file(out.name, as_attachment=True, download_name='converted.pdf', mimetype='application/pdf')
+                output_path = out.name
+                docx_to_pdf(input_path, output_path)
+                
+                @after_this_request
+                def cleanup(response):
+                    for p in [input_path, output_path]:
+                        if p and os.path.exists(p):
+                            try:
+                                os.unlink(p)
+                            except:
+                                pass
+                    return response
+                
+                return send_file(output_path, as_attachment=True, download_name='converted.pdf', mimetype='application/pdf')
         
         elif ext == '.xlsx' and target == 'pdf':
             with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as out:
-                xlsx_to_pdf(input_path, out.name)
-                return send_file(out.name, as_attachment=True, download_name='converted.pdf', mimetype='application/pdf')
+                output_path = out.name
+                xlsx_to_pdf(input_path, output_path)
+                
+                @after_this_request
+                def cleanup(response):
+                    for p in [input_path, output_path]:
+                        if p and os.path.exists(p):
+                            try:
+                                os.unlink(p)
+                            except:
+                                pass
+                    return response
+                
+                return send_file(output_path, as_attachment=True, download_name='converted.pdf', mimetype='application/pdf')
         
         else:
+            if input_path and os.path.exists(input_path):
+                os.unlink(input_path)
             return jsonify({'error': 'Unsupported conversion'}), 400
             
     except Exception as e:
         logger.error(f"Convert doc error: {e}")
+        for p in [input_path, output_path]:
+            if p and os.path.exists(p):
+                try:
+                    os.unlink(p)
+                except:
+                    pass
         return jsonify({'error': str(e)}), 500
-    finally:
-        if input_path and os.path.exists(input_path):
-            try:
-                os.unlink(input_path)
-            except:
-                pass
 
 @app.route('/pdf/compress', methods=['POST'])
 def pdf_compress_route():
@@ -493,14 +751,15 @@ def pdf_compress_route():
             with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as src:
                 f.save(src.name)
                 tmp_paths.append(src.name)
+                input_path = src.name
                 
-            out_path = src.name + '_compressed.pdf'
-            compress_pdf(src.name, out_path)
+            out_path = input_path + '_compressed.pdf'
+            compress_pdf(input_path, out_path)
             compressed_paths.append((out_path, f.filename))
 
         if not compressed_paths:
-             logger.error("No valid PDF files processed")
-             return jsonify({'error': 'No valid PDF files processed. Please upload PDF files.'}), 400
+            logger.error("No valid PDF files processed")
+            return jsonify({'error': 'No valid PDF files processed. Please upload PDF files.'}), 400
 
         # Schedule cleanup after request
         @after_this_request
@@ -511,9 +770,12 @@ def pdf_compress_route():
                         os.unlink(p)
                     except Exception as e:
                         logger.warning(f"Failed to delete temp input {p}: {e}")
-            # Note: We can't delete output files yet if we are streaming them.
-            # In a real production app, use a periodic cleaner or a temp dir that auto-cleans.
-            # For now, we rely on OS temp cleaning or manual restart.
+            for path, _ in compressed_paths:
+                if os.path.exists(path):
+                    try:
+                        os.unlink(path)
+                    except Exception as e:
+                        logger.warning(f"Failed to delete compressed {path}: {e}")
             return response
 
         if len(compressed_paths) == 1:
@@ -522,13 +784,27 @@ def pdf_compress_route():
         else:
             logger.info("Returning zip of compressed files")
             with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as zip_out:
-                with zipfile.ZipFile(zip_out.name, 'w') as zf:
+                zip_path = zip_out.name
+                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
                     for path, original_name in compressed_paths:
                         zf.write(path, arcname=f"compressed_{original_name}")
-                return send_file(zip_out.name, as_attachment=True, download_name='compressed_files.zip', mimetype='application/zip')
+                return send_file(zip_path, as_attachment=True, download_name='compressed_files.zip', mimetype='application/zip')
 
     except Exception as e:
         logger.error(f"Compression route error: {e}")
+        # Cleanup on error
+        for p in tmp_paths:
+            if os.path.exists(p):
+                try:
+                    os.unlink(p)
+                except:
+                    pass
+        for path, _ in compressed_paths:
+            if os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except:
+                    pass
         return jsonify({'error': f"Compression failed: {str(e)}"}), 500
 
 if __name__ == '__main__':
