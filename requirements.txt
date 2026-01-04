@@ -1,8 +1,8 @@
-doc.save(output_path, garbage=4, deflate=True, clean=True)doc.save(output_path, garbage=4, deflate=True, clean=True)Flask
+Flask
 flask-cors
 gunicorn
-ezdxf
 numpy
+ezdxf
 opencv-python-headless
 PyPDF2
 pdf2docx
