@@ -30,13 +30,13 @@ app = Flask(__name__)
 # Explicitly allow all origins and headers for debugging
 CORS(app, resources={r"/*": {"origins": "*", "allow_headers": "*", "methods": "*"}})
 
-# Set Max Content Length to 50MB
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
+# Set Max Content Length to 100MB (as requested)
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024
 
 @app.errorhandler(RequestEntityTooLarge)
 def handle_file_too_large(e):
     logger.error(f"File too large error: {e}")
-    return jsonify({'error': 'File terlalu besar. Maksimum ukuran file adalah 50MB.'}), 413
+    return jsonify({'error': 'File terlalu besar. Maksimum ukuran file adalah 100MB.'}), 413
 
 @app.errorhandler(500)
 def handle_internal_error(e):
