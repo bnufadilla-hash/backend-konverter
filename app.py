@@ -5,6 +5,7 @@ import ezdxf
 from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
+from werkzeug.exceptions import RequestEntityTooLarge
 import tempfile
 from PyPDF2 import PdfMerger
 from pdf2docx import Converter
@@ -22,8 +23,12 @@ import zipfile
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
 
-# Set Max Content Length to 20MB
-app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024
+# Set Max Content Length to 50MB
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
+
+@app.errorhandler(RequestEntityTooLarge)
+def handle_file_too_large(e):
+    return jsonify({'error': 'File terlalu besar. Maksimum ukuran file adalah 50MB.'}), 413
 
 def image_to_dxf(image_path, output_path):
     # Read image with alpha channel support (IMREAD_UNCHANGED)
