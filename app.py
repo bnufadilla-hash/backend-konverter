@@ -22,6 +22,9 @@ import zipfile
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
 
+# Set Max Content Length to 20MB
+app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024
+
 def image_to_dxf(image_path, output_path):
     # Read image with alpha channel support (IMREAD_UNCHANGED)
     img = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
@@ -157,11 +160,76 @@ def merge_pdfs(paths, output_path):
     merger.close()
 
 def compress_pdf(input_path, output_path):
-    # Using fitz (PyMuPDF) to compress PDF
-    doc = fitz.open(input_path)
-    # Use garbage=4 (deduplicate objects) and deflate=True (compress streams)
-    doc.save(output_path, garbage=4, deflate=True)
-    doc.close()
+    # Aggressive compression to target ~50% size reduction
+    # 1. Downsample images > 1024px
+    # 2. Convert images to JPEG with quality 60
+    # 3. Clean and deflate PDF structure
+    
+    try:
+        doc = fitz.open(input_path)
+        
+        # Subset fonts
+        try:
+            doc.subset_fonts()
+        except Exception:
+            pass
+
+        processed_xrefs = set()
+        
+        for page in doc:
+            for img in page.get_images():
+                xref = img[0]
+                if xref in processed_xrefs:
+                    continue
+                processed_xrefs.add(xref)
+                
+                try:
+                    pix = fitz.Pixmap(doc, xref)
+                    
+                    # Check if image is large enough to benefit from downscaling
+                    if pix.width > 1024 or pix.height > 1024:
+                        # Convert to RGB if not already (e.g. CMYK)
+                        if pix.n >= 4:
+                            pix = fitz.Pixmap(fitz.csRGB, pix)
+                        
+                        # Scale down
+                        # We want to reduce size significantly. 
+                        # Let's target a max dimension of 1024.
+                        scale = 1024 / max(pix.width, pix.height)
+                        if scale < 0.9: # Only if reduction is > 10%
+                            new_w = int(pix.width * scale)
+                            new_h = int(pix.height * scale)
+                            pix = fitz.Pixmap(pix, new_w, new_h)
+                    
+                    # Recompress as JPEG with lower quality (default often 75-95, we go 60 for "half size")
+                    # Only if it wasn't already a highly compressed small image?
+                    # Actually, recompressing everything to JPEG q=60 is the surest way to drop size.
+                    
+                    # Check if it's already a small image or mask? Skip masks.
+                    if pix.n < 3 and pix.alpha == 0: 
+                        # Grayscale or mono without alpha
+                        pass
+                    
+                    new_data = pix.tobytes("jpeg", jpg_quality=60)
+                    doc.update_image(xref, data=new_data)
+                    
+                    pix = None # free memory
+                except Exception as e:
+                    print(f"Image compression skipped for xref {xref}: {e}")
+                    pass
+
+        doc.save(output_path, garbage=4, deflate=True, clean=True)
+        doc.close()
+        
+    except Exception as e:
+        # Fallback to simple compression if advanced fails
+        print(f"Advanced compression failed: {e}, falling back to simple save.")
+        try:
+            doc = fitz.open(input_path)
+            doc.save(output_path, garbage=4, deflate=True)
+            doc.close()
+        except:
+            raise e
 
 def pdf_to_image(pdf_path, image_path):
     doc = fitz.open(pdf_path)
@@ -392,3 +460,7 @@ def pdf_compress_route():
         # A common strategy is to use after_request or a background task, but simple tempfile is hard to clean perfectly in basic Flask.
         # For this snippet, we leave the output files. In a production app, use a proper temp directory lifecycle.
         pass
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
